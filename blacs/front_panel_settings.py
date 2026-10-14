@@ -13,14 +13,12 @@
 import os
 import logging
 
-from qtutils.qt.QtCore import *
-from qtutils.qt.QtGui import *
-from qtutils.qt.QtWidgets import *
+from qtutils.qt.QtWidgets import QMessageBox
 
 import labscript_utils.excepthook
 import numpy
 import labscript_utils.h5_lock, h5py
-from qtutils import *
+from qtutils import inmain_decorator
 
 from labscript_utils.connections import ConnectionTable
 
@@ -137,7 +135,7 @@ class FrontPanelSettings(object):
         #    This is because we have the original channel, and the moved channel in the same place
         #-1: Device no longer in the connection table, throw error
         #-2: Device parameters not compatible, throw error
-        if type(result) == tuple:
+        if isinstance(result, tuple):
             connection = result[1]
             result = result[0]
 
@@ -285,7 +283,7 @@ class FrontPanelSettings(object):
 
             if save_conn_table or result:
                 with h5py.File(current_file,'r+') as hdf5_file:
-                    if hdf5_file['/'].get('front_panel') != None:
+                    if hdf5_file['/'].get('front_panel') is not None:
                         # Create a dialog to ask whether we can overwrite!
                         overwrite = False
                         if not silent:
@@ -296,7 +294,7 @@ class FrontPanelSettings(object):
                             message.setDefaultButton(QMessageBox.No)
                             message.setIcon(QMessageBox.Question)
                             message.setWindowTitle("BLACS")
-                            resp = message.exec_()
+                            resp = message.exec()
 
                             if resp == QMessageBox.Yes :
                                 overwrite = True
@@ -313,7 +311,7 @@ class FrontPanelSettings(object):
                                 message.setText("Front Panel not saved.")
                                 message.setIcon(QMessageBox.Information)
                                 message.setWindowTitle("BLACS")
-                                message.exec_()
+                                message.exec()
                             else:
                                 logger.info("Front Panel not saved as it already existed in the h5 file '"+current_file+"'")
                             return
@@ -327,7 +325,7 @@ class FrontPanelSettings(object):
                     message.setText("The Front Panel was not saved as the file selected contains a connection table which is not a subset of the BLACS connection table.")
                     message.setIcon(QMessageBox.Information)
                     message.setWindowTitle("BLACS")
-                    message.exec_()
+                    message.exec()
                 else:
                     logger.info("Front Panel not saved as the connection table in the h5 file '"+current_file+"' didn't match the current connection table.")
                 return
