@@ -33,7 +33,7 @@ globals to use during the compilation of the connection table (commonly used as 
 conversion parameters), as well as a list of unit conversion Python files, to watch for any
 changes. At startup, the plugin launches a background thread that monitors changes to
 these files, as well as the connection table Python file and compiled connection table hdf5
-file. If any modifications are detected, a notification is shown at the top of BLACS informing
+file. If any modifications are detected, a notification is shown at the top of rming
 that the lab connection table should be recompiled. If recompilation is chosen by the user,
 the plugin manages the recompilation of the connection table using the runmanager API
 and output from this process is displayed in a window. Once recompilation is successful,

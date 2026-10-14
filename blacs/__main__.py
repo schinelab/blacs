@@ -230,7 +230,19 @@ class BLACS(object):
         splash.update_text('loading device front panel settings')
         # Find which devices are connected to BLACS, and what their labscript class names are:
         logger.info('finding connected devices in connection table')
+
         self.attached_devices = self.connection_table.get_attached_devices()
+
+        dict1 = self.connection_table.table
+
+
+        # logger.info(dict1["cam2"].BLACS_connection)
+        #NOTE: I commented out the next line in order to get blacks to complie temporarily (it does not solve the issue):
+        try:
+            logger.info(dict1["cam1"].BLACS_connection)
+        except:
+            pass
+        logger.info(self.attached_devices)
 
         # Store the panes in a dictionary for easy access
         self.panes['tab_top_vertical_splitter'] = self.ui.tab_top_vertical_splitter
@@ -759,6 +771,7 @@ if __name__ == '__main__':
     splash.update_text('loading connection table')
     logger.info('About to load connection table: %s'%exp_config.get('paths','connection_table_h5'))
     connection_table_h5_file = exp_config.get('paths','connection_table_h5')
+    logger.info(connection_table_h5_file)
     connection_table = ConnectionTable(connection_table_h5_file, logging_prefix='BLACS', exceptions_in_thread=True)
 
     logger.info('connection table loaded')

@@ -459,8 +459,8 @@ class DeviceTab(Tab):
         for channel in sorted(self._last_remote_values):
             remote_value = self._last_remote_values[channel]
             if channel not in self._last_programmed_values:
-                raise RuntimeError('The worker function check_remote_values for device %s is returning data for channel %s but the BLACS tab is not programmed to handle this channel'%(self.device_name,channel))
-            
+                # raise RuntimeError('The worker function check_remote_values for device %s is returning data for channel %s but the BLACS tab is not programmed to handle this channel %s %s'%(self.device_name,channel, self._last_remote_values, self._last_programmed_values))
+                pass
             # A variable to indicate if this channel has changed
             changed = False
             
@@ -520,7 +520,7 @@ class DeviceTab(Tab):
                     ui.front_value.setText(front_value)
                     ui.remote_value.setText(remote_value)
             else:
-                raise RuntimeError('device_base_class.py is not programmed to handle channel types other than DDS, AO and DO in check_remote_values')
+                raise RuntimeError('device_base_class.py is not programmed to handle channel types other than DDS, AO and DO in check_remote_values: %s not in %s, %s, or %s'%(channel, self._DDS, self._DO, self._AO))
                     
             if changed:
                 overall_changed = True
