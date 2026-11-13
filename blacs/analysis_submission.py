@@ -17,8 +17,8 @@ import time
 import sys
 import queue
 
-from qtutils.qt.QtCore import Qt, QSize
-from qtutils.qt.QtGui import QIcon
+from qtutils.qt.QtCore import Qt
+from qtutils.icons import Icon
 
 from qtutils import inmain_decorator, UiLoader
 from zprocess import TimeoutError, raise_exception_in_thread
@@ -49,8 +49,8 @@ class AnalysisSubmission(object):
         self._waiting_for_submission = []
         self.failure_reason = None
         self.server_online = 'offline'
-        self.send_to_server = False
-        self.server = ''
+        self.send_to_server = True
+        self.server = 'localhost'
         self.time_of_last_connectivity_check = 0
 
         self.mainloop_thread = threading.Thread(target=self.mainloop)
@@ -130,14 +130,13 @@ class AnalysisSubmission(object):
                     'offline': 'Server not responding',
                     '': 'Disabled'}
 
-        icon = QIcon(icon_names.get(self._server_online, ':/qtutils/fugue/exclamation-red'))
-        pixmap = icon.pixmap(QSize(16, 16))
+        icon = Icon(icon_names.get(self._server_online, ':/qtutils/fugue/exclamation-red'))
         tooltip = tooltips.get(self._server_online, "Invalid server status: %s" % self._server_online)
         if self.failure_reason is not None:
             tooltip += '\n' + self.failure_reason
 
         # Update GUI:
-        self._ui.server_online.setPixmap(pixmap)
+        self._ui.server_online.setIcon(icon)
         self._ui.server_online.setToolTip(tooltip)
         self.update_waiting_files_message()
 
@@ -217,7 +216,7 @@ class AnalysisSubmission(object):
                 else:
                     raise ValueError('Invalid signal: %s'%str(signal))
 
-                self._mainloop_logger.info('Processed signal: %s'%str(signal))
+                self._mainloop_logger.info('Processed signal: %s', signal)
             except Exception:
                 # Raise in a thread for visibility, but keep going
                 raise_exception_in_thread(sys.exc_info())
@@ -250,7 +249,7 @@ class AnalysisSubmission(object):
         success = True
         while self._waiting_for_submission and success:
             path = self._waiting_for_submission[0]
-            self._mainloop_logger.info('Submitting run file %s.\n'%os.path.basename(path))
+            self._mainloop_logger.info('Submitting run file %s.\n', os.path.basename(path))
             data = {'filepath': labscript_utils.shared_drive.path_to_agnostic(path)}
             self.server_online = 'checking'
             try:

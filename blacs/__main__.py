@@ -13,6 +13,7 @@
 '''BLACS GUI and supporting code
 '''
 import labscript_utils.excepthook
+labscript_utils.excepthook.install()
 
 import os
 
@@ -27,18 +28,23 @@ splash = Splash(os.path.join(os.path.dirname(__file__), 'blacs.svg'))
 splash.show()
 
 splash.update_text('importing standard library modules')
+import inspect
 import subprocess
 import sys
 import time
 from pathlib import Path
 import platform
+import signal
 import importlib.metadata
 WINDOWS = platform.system() == 'Windows'
+# Seconds to wait for the queue manager to finish the current shot when BLACS is closed
+QUEUE_STOP_TIMEOUT = 30
 
 # No splash update for Qt - the splash code has already imported it:
-from qtutils import inmain_decorator, inmain_later, inmain, inthread, UiLoader
+from qtutils import inmain_later, inmain, inthread, UiLoader
 import qtutils.icons  # import has side-effects we rely on
-from qtutils.qt.QtCore import QTimer, Qt, qVersion, QEvent
+from qtutils.icons import Icon
+from qtutils.qt.QtCore import QTimer, Qt, qVersion, QEvent, QByteArray
 from qtutils.qt.QtGui import QIcon, QColor, QPalette
 from qtutils.qt.QtWidgets import (
     QMainWindow,
@@ -55,8 +61,7 @@ PYQT_VERSION_STR = importlib.metadata.version(QT_ENV)
 splash.update_text("importing zmq and zprocess")
 import zmq
 import zprocess
-from zprocess import raise_exception_in_thread
-import zprocess.locking
+from zprocess import raise_exception_in_thread, port_in_use
 
 
 splash.update_text('importing h5_lock and h5py')
@@ -79,23 +84,24 @@ process_tree.zlock_client.set_process_name('BLACS')
 logger = setup_logging('BLACS')
 labscript_utils.excepthook.set_logger(logger)
 
-logger.info(f'Python version {sys.version}')
-logger.info(f'Platform: {sys.platform}')
-logger.info(f'windows version: {sys.getwindowsversion() if WINDOWS else None}')
-logger.info(f'PyZMQ version: {zmq.__version__}')
-logger.info(f'ZMQ version: {zmq.zmq_version()}')
-logger.info(f'h5py version: {h5py.version.info}')
-logger.info(f'Qt enviroment: {QT_ENV}')
-logger.info(f'PySide/PyQt version: {PYQT_VERSION_STR}')
-logger.info(f'Qt version: {qVersion()}')
-logger.info(f'qtutils version: {qtutils.__version__}')
-logger.info(f'zprocess version: {zprocess.__version__}')
-logger.info(f'labscript_utils version: {labscript_utils.__version__}')
-logger.info(f'BLACS version: {blacs.__version__}')
+logger.info('Python version %s', sys.version)
+logger.info('Platform: %s', sys.platform)
+logger.info('windows version: %s', sys.getwindowsversion() if WINDOWS else None)
+logger.info('PyZMQ version: %s', zmq.__version__)
+logger.info('ZMQ version: %s', zmq.zmq_version())
+logger.info('h5py version: %s', h5py.version.info)
+logger.info('Qt enviroment: %s', QT_ENV)
+logger.info('PySide/PyQt version: %s', PYQT_VERSION_STR)
+logger.info('Qt version: %s', qVersion())
+logger.info('qtutils version: %s', qtutils.__version__)
+logger.info('zprocess version: %s', zprocess.__version__)
+logger.info('labscript_utils version: %s', labscript_utils.__version__)
+logger.info('BLACS version: %s', blacs.__version__)
 
 # Connection Table Code
 from labscript_utils.connections import ConnectionTable
 #Draggable Tab Widget Code
+from labscript_utils.qtwidgets.application import setup_application
 from labscript_utils.qtwidgets.dragdroptab import DragDropTabWidget
 # Lab config code
 from labscript_utils.labconfig import LabConfig
@@ -103,11 +109,12 @@ from labscript_profile import hostname
 # Analysis Submission code
 from blacs.analysis_submission import AnalysisSubmission
 # Queue Manager Code
-from blacs.experiment_queue import QueueManager, QueueTreeview
+from blacs.experiment_queue import QueueManager
+from blacs.queue_view import QueueView
 # Module containing hardware compatibility:
 from labscript_utils import device_registry
 # Save/restore frontpanel code
-from blacs.front_panel_settings import FrontPanelSettings
+from blacs.front_panel_settings import FrontPanelSettings, eval_save_data
 # Notifications system
 from blacs.notifications import Notifications
 # Preferences system
@@ -128,17 +135,25 @@ class BLACSWindow(QMainWindow):
                 subprocess.Popen([sys.executable] + sys.argv)
         else:
             event.ignore()
-            logger.info('destroy called')
             if not self.blacs.exiting:
+                logger.info('destroy called')
                 self.blacs.exiting = True
-                self.blacs.queue.manager_running = False
+                self.blacs.queue.stop()
+                self.blacs.queue_stop_deadline = time.time() + QUEUE_STOP_TIMEOUT
+            elif not self.blacs.exit_started and (
+                not self.blacs.queue.manager.is_alive()
+                or time.time() > self.blacs.queue_stop_deadline
+            ):
+                if self.blacs.queue.manager.is_alive():
+                    logger.warning('Queue manager did not stop, exiting anyway')
+                self.blacs.exit_started = True
                 self.blacs.settings.close()
                 experiment_server.shutdown()
                 for module_name, plugin in self.blacs.plugins.items():
                     try:
                         plugin.close()
                     except Exception as e:
-                        logger.error('Could not close plugin %s. Error was: %s'%(module_name,str(e)))
+                        logger.error('Could not close plugin %s. Error was: %s', module_name, e)
 
                 inmain_later(self.blacs.on_save_exit)
 
@@ -169,8 +184,9 @@ class EasterEggButton(QToolButton):
     def __init__(self):
         QToolButton.__init__(self)
         self.setFixedSize(24, 24) # Ensure we're the same size as the other buttons
-        self.icon_atom = QIcon(':qtutils/custom/atom')
-        self.icon_smiley = QIcon(':qtutils/fugue/smiley-lol')
+        self.setAutoRaise(True)
+        self.icon_atom = Icon(':qtutils/custom/atom')
+        self.icon_smiley = Icon(':qtutils/fugue/smiley-lol')
         self.icon_none = QIcon(None)
         self.icon_mouse_over = self.icon_atom
         self.clicked.connect(self.on_click)
@@ -230,12 +246,14 @@ class BLACS(object):
         #self.qt_application.aboutToQuit.connect(self.destroy)
         self._relaunch = False
         self.exiting = False
+        self.exit_started = False
+        self.queue_stop_deadline = None
         self.exit_complete = False
 
         logger.info('Loading BLACS ui')
         #self.ui = BLACSWindow(self).ui
         loader = UiLoader()
-        loader.registerCustomWidget(QueueTreeview)
+        loader.registerCustomWidget(QueueView)
         #loader.registerCustomPromotion('BLACS',BLACSWindow)
         self.ui = loader.load(os.path.join(BLACS_DIR, 'main.ui'), BLACSWindow())
         logger.info('BLACS ui loaded')
@@ -307,7 +325,7 @@ class BLACS(object):
                 self.settings_dict[device_name]["front_panel_settings"] = settings[device_name] if device_name in settings else {}
                 self.settings_dict[device_name]["saved_data"] = tab_data[device_name]['data'] if device_name in tab_data else {}
                 # Instantiate the device
-                logger.info('instantiating %s'%device_name)
+                logger.info('instantiating %s', device_name)
                 TabClass = device_registry.get_BLACS_tab(labscript_device_class_name)
                 self.tablist[device_name] = TabClass(self.tab_widgets[0],self.settings_dict[device_name])
             except Exception:
@@ -322,13 +340,13 @@ class BLACS(object):
         # setup the plugin system
         settings_pages = []
         self.plugins = {}
-        plugin_settings = eval(tab_data['BLACS settings']['plugin_data']) if 'plugin_data' in tab_data['BLACS settings'] else {}
+        plugin_settings = eval_save_data(tab_data['BLACS settings']['plugin_data'], 'the saved plugin data') if 'plugin_data' in tab_data['BLACS settings'] else {}
         for module_name, module in plugins.modules.items():
             try:
                 # instantiate the plugin
                 self.plugins[module_name] = module.Plugin(plugin_settings[module_name] if module_name in plugin_settings else {})
             except Exception:
-                logger.exception('Could not instantiate plugin \'%s\'. Skipping' % module_name)
+                logger.exception("Could not instantiate plugin '%s'. Skipping", module_name)
 
         logger.info('creating plugin tabs')
         # setup the plugin tabs
@@ -350,7 +368,7 @@ class BLACS(object):
                         plugin.tabs_created(tab_dict)
 
             except Exception:
-                logger.exception('Could not instantiate tab for plugin \'%s\'. Skipping')
+                logger.exception("Could not instantiate tab for plugin '%s'. Skipping", module_name)
 
         logger.info('reordering tabs')
         self.order_tabs(tab_data)
@@ -362,7 +380,7 @@ class BLACS(object):
         if 'analysis_data' not in tab_data['BLACS settings']:
             tab_data['BLACS settings']['analysis_data'] = {}
         else:
-            tab_data['BLACS settings']['analysis_data'] = eval(tab_data['BLACS settings']['analysis_data'])
+            tab_data['BLACS settings']['analysis_data'] = eval_save_data(tab_data['BLACS settings']['analysis_data'], 'the saved analysis settings')
         self.analysis_submission.restore_save_data(tab_data['BLACS settings']["analysis_data"])
 
         splash.update_text("starting queue manager")
@@ -372,11 +390,7 @@ class BLACS(object):
         if 'queue_data' not in tab_data['BLACS settings']:
             tab_data['BLACS settings']['queue_data'] = {}
         else:
-            # quick fix for qt objects not loading that were saved before qtutil 2 changes
-            try:
-                tab_data['BLACS settings']['queue_data'] = eval(tab_data['BLACS settings']['queue_data'])
-            except NameError:
-                tab_data['BLACS settings']['queue_data'] = {}
+            tab_data['BLACS settings']['queue_data'] = eval_save_data(tab_data['BLACS settings']['queue_data'], 'the saved queue settings')
         self.queue.restore_save_data(tab_data['BLACS settings']['queue_data'])
 
         blacs_data = {'exp_config':self.exp_config,
@@ -396,7 +410,7 @@ class BLACS(object):
                         create_menu(child,child_menu_params)
                 else:
                     if 'icon' in menu_parameters:
-                        child = parent.addAction(QIcon(menu_parameters['icon']), menu_parameters['name'])
+                        child = parent.addAction(Icon(menu_parameters['icon']), menu_parameters['name'])
                     else:
                         child = parent.addAction(menu_parameters['name'])
 
@@ -438,7 +452,7 @@ class BLACS(object):
                     settings_callbacks.append(callbacks['settings_changed'])
 
             except Exception:
-                logger.exception('Plugin \'%s\' error. Plugin may not be functional.'%module_name)
+                logger.exception("Plugin '%s' error. Plugin may not be functional.", module_name)
 
 
         # setup the BLACS preferences system
@@ -452,16 +466,22 @@ class BLACS(object):
         blacs_data['settings'] = self.settings
 
         for module_name, plugin in self.plugins.items():
+            # Call plugin_setup_complete once, with the arguments its signature accepts.
+            setup_complete = plugin.plugin_setup_complete
             try:
-                plugin.plugin_setup_complete(blacs_data)
-            except Exception:
-                logger.exception('Error in plugin_setup_complete() for plugin \'%s\'. Trying again with old call signature...' % module_name)
+                inspect.signature(setup_complete).bind(blacs_data)
+                args = (blacs_data,)
+            except TypeError:
                 # backwards compatibility for old plugins
-                try:
-                    plugin.plugin_setup_complete()
-                    logger.warning('Plugin \'%s\' using old API. Please update Plugin.plugin_setup_complete method to accept a dictionary of blacs_data as the only argument.'%module_name)
-                except Exception:
-                    logger.exception('Plugin \'%s\' error. Plugin may not be functional.'%module_name)
+                args = ()
+                logger.warning("Plugin '%s' using old API. Please update Plugin.plugin_setup_complete method to accept a dictionary of blacs_data as the only argument.", module_name)
+            except ValueError:
+                # No introspectable signature; assume the current API.
+                args = (blacs_data,)
+            try:
+                setup_complete(*args)
+            except Exception:
+                logger.exception("Plugin '%s' error. Plugin may not be functional.", module_name)
 
         # Connect menu actions
         self.ui.actionOpenPreferences.triggered.connect(self.on_open_preferences)
@@ -490,42 +510,25 @@ class BLACS(object):
         self._relaunch = bool(value)
 
     def restore_window(self,tab_data):
-        # read out position settings:
+        """Restore the main window geometry and the splitter positions from the
+        saved settings. Settings that are missing are left at their defaults."""
+        settings = tab_data['BLACS settings']
         try:
-            # There are some dodgy hacks going on here to try and restore the window position correctly
-            # Unfortunately Qt has two ways of measuring teh window position, one with the frame/titlebar
-            # and one without. If you use the one that measures including the titlebar, you don't
-            # know what the window size was when the window was UNmaximized.
-            #
-            # Anyway, no idea if this works cross platform (tested on windows 8)
-            # Feel free to rewrite this, along with the code in front_panel_settings.py
-            # which stores the values
-            #
-            # Actually this is a waste of time because if you close when maximized, reoopen and then
-            # de-maximize, the window moves to a random position (not the position it was at before maximizing)
-            # so bleh!
-            self.ui.move(
-                tab_data['BLACS settings']["window_xpos"]
-                - tab_data['BLACS settings']['window_frame_width'] // 2,
-                tab_data['BLACS settings']["window_ypos"]
-                - tab_data['BLACS settings']['window_frame_height']
-                + tab_data['BLACS settings']['window_frame_width'] // 2,
-            )
-            self.ui.resize(
-                tab_data['BLACS settings']["window_width"],
-                tab_data['BLACS settings']["window_height"],
-            )
-
-            if 'window_maximized' in tab_data['BLACS settings'] and tab_data['BLACS settings']['window_maximized']:
-                self.ui.showMaximized()
+            if 'window_geometry' in settings:
+                self.ui.restoreGeometry(QByteArray(bytes(settings['window_geometry'])))
 
             for pane_name,pane in self.panes.items():
-                pane.setSizes(tab_data['BLACS settings'][pane_name])
+                if pane_name in settings:
+                    pane.setSizes(settings[pane_name])
 
         except Exception as e:
-            logger.exception("Unable to load window and notebook defaults. Exception:"+str(e))
+            logger.exception("Unable to load window and notebook defaults. Exception:%s", e)
 
     def order_tabs(self,tab_data):
+        # Shot files do not contain tab positions
+        if not any('notebook' in data for data in tab_data.values()):
+            return
+
         # Move the tabs to the correct notebook
         for tab_name in self.tablist.keys():
             notebook_num = 0
@@ -593,7 +596,7 @@ class BLACS(object):
                     # TODO: Warn that this will restore values, but not channels that are locked
                     message = QMessageBox()
                     message.setText("""Warning: This will modify front panel values and cause device output values to update.
-                    \nThe queue and files waiting to be sent for analysis will be cleared.
+                    \nIf the file is a BLACS settings file, the queue and files waiting to be sent for analysis will be replaced by those in the file.
                     \n
                     \nNote: Channels that are locked will not be updated.\n\nDo you wish to continue?""")
                     message.setIcon(QMessageBox.Warning)
@@ -614,20 +617,16 @@ class BLACS(object):
                         if 'queue_data' not in tab_data['BLACS settings']:
                             tab_data['BLACS settings']['queue_data'] = {}
                         else:
-                            # quick fix for qt objects not loading that were saved before qtutil 2 changes
-                            try:
-                                tab_data['BLACS settings']['queue_data'] = eval(tab_data['BLACS settings']['queue_data'])
-                            except NameError:
-                                tab_data['BLACS settings']['queue_data'] = {}
+                            tab_data['BLACS settings']['queue_data'] = eval_save_data(tab_data['BLACS settings']['queue_data'], 'the saved queue settings')
                         self.queue.restore_save_data(tab_data['BLACS settings']['queue_data'])
                         # restore analysis data
                         if 'analysis_data' not in tab_data['BLACS settings']:
                             tab_data['BLACS settings']['analysis_data'] = {}
                         else:
-                            tab_data['BLACS settings']['analysis_data'] = eval(tab_data['BLACS settings']['analysis_data'])
+                            tab_data['BLACS settings']['analysis_data'] = eval_save_data(tab_data['BLACS settings']['analysis_data'], 'the saved analysis settings')
                         self.analysis_submission.restore_save_data(tab_data['BLACS settings']["analysis_data"])
                 except Exception as e:
-                    logger.exception("Unable to load the front panel in %s."%(filepath))
+                    logger.exception("Unable to load the front panel in %s.", filepath)
                     message = QMessageBox()
                     message.setText("Unable to load the front panel. The error encountered is printed below.\n\n%s"%str(e))
                     message.setIcon(QMessageBox.Information)
@@ -683,11 +682,11 @@ class BLACS(object):
                 try:
                     current_page = tab.close_tab(finalise=False)
                 except Exception as e:
-                    logger.error('Couldn\'t close tab:\n%s' % str(e))
+                    logger.error("Couldn't close tab:\n%s", e)
                 del self.tablist[name]
                 continue
-            fatal_error = tab.state == 'fatal error'
-            if not tab.shutdown_workers_complete and overdue or fatal_error:
+            stopped = tab.state in ('fatal error', 'stopping', 'stopped')
+            if not tab.shutdown_workers_complete and overdue or stopped:
                 # Give up on cleanly shutting down this tab's worker processes:
                 tab.shutdown_workers_complete = True
             if tab.shutdown_workers_complete:
@@ -696,7 +695,7 @@ class BLACS(object):
                     try:
                         current_page = tab.close_tab(finalise=False)
                     except Exception as e:
-                        logger.error('Couldn\'t close tab:\n%s' % str(e))
+                        logger.error("Couldn't close tab:\n%s", e)
                         del self.tablist[name]
                     else:
                         # Call finalise_close_tab in a thread since it can be blocking.
@@ -745,45 +744,25 @@ class ExperimentServer(ZMQServer):
     def handler(self, h5_filepath):
         print(h5_filepath)
         message = self.process(h5_filepath)
-        logger.info('Request handler: %s ' % message.strip())
+        logger.info('Request handler: %s ', message.strip())
         return message
 
-    @inmain_decorator(wait_for_return=True)
     def process(self,h5_filepath):
         # Convert path to local slashes and shared drive prefix:
-        logger.info('received filepath: %s'%h5_filepath)
+        logger.info('received filepath: %s', h5_filepath)
         h5_filepath = labscript_utils.shared_drive.path_to_local(h5_filepath)
-        logger.info('local filepath: %s'%h5_filepath)
+        logger.info('local filepath: %s', h5_filepath)
         return app.queue.process_request(h5_filepath)
 
 
 if __name__ == '__main__':
-    if 'tracelog' in sys.argv:
-        ##########
-        import labscript_utils.tracelog
-        labscript_utils.tracelog.log(os.path.join(BLACS_DIR, 'blacs_trace.log'),
-                                     ['__main__','BLACS.tab_base_classes',
-                                      'qtutils',
-                                      'labscript_utils.qtwidgets.ddsoutput',
-                                      'labscript_utils.qtwidgets.analogoutput',
-                                      'BLACS.hardware_interfaces.ni_pcie_6363',
-                                      'BLACS.hardware_interfaces.output_classes',
-                                      'BLACS.device_base_class',
-                                      'BLACS.tab_base_classes',
-                                      'BLACS.plugins.connection_table',
-                                      'BLACS.recompile_and_restart',
-                                      'filewatcher',
-                                      'queue',
-                                      'notifications',
-                                      'connections',
-                                      'analysis_submission',
-                                      'settings',
-                                      'front_panel_settings',
-                                      'labscript_utils.h5_lock',
-                                      'labscript_utils.shared_drive',
-                                      'labscript_utils.labconfig',
-                                      'zprocess',
-                                     ], sub=True)
+    splash.update_text('initialising Qt application')
+    qapplication = QApplication.instance()
+    if qapplication is None:
+        qapplication = QApplication(sys.argv)
+    setup_application(qapplication)
+    qapplication.setAttribute(Qt.AA_DontShowIconsInMenus, False)
+    logger.info('QApplication instantiated')
 
     splash.update_text('loading labconfig')
     required_config_params = {
@@ -799,32 +778,47 @@ if __name__ == '__main__':
     settings_path = str(settings_dir / f'{hostname()}_BLACS.h5')
 
     port = int(exp_config.get('ports','BLACS'))
-
-    # Start experiment server
-    splash.update_text('starting experiment server')
-    experiment_server = ExperimentServer(port)
+    if port_in_use(port):
+        message = (
+            f"BLACS cannot start because port {port}, which is the BLACS port in the "
+            "labconfig, is in use. Another copy of BLACS is probably running."
+        )
+        logger.error(message)
+        splash.hide()
+        # Upon seeing a ctrl-c interrupt, close the message box:
+        signal.signal(signal.SIGINT, lambda *args: qapplication.exit())
+        QMessageBox.critical(None, 'BLACS', message)
+        sys.exit(1)
 
     # Create Connection Table object
     splash.update_text('loading connection table')
-    logger.info('About to load connection table: %s'%exp_config.get('paths','connection_table_h5'))
+    logger.info('About to load connection table: %s', exp_config.get('paths','connection_table_h5'))
     connection_table_h5_file = exp_config.get('paths','connection_table_h5')
     logger.info(connection_table_h5_file)
     connection_table = ConnectionTable(connection_table_h5_file, logging_prefix='BLACS', exceptions_in_thread=True)
 
     logger.info('connection table loaded')
 
-    splash.update_text('initialising Qt application')
-    qapplication = QApplication.instance()
-    if qapplication is None:
-        qapplication = QApplication(sys.argv)
-    qapplication.setAttribute(Qt.AA_DontShowIconsInMenus, False)
-    logger.info('QApplication instantiated')
     app = BLACS(qapplication)
 
     logger.info('BLACS instantiated')
+
+    splash.update_text('starting experiment server')
+    experiment_server = ExperimentServer(port)
     splash.hide()
 
-    def execute_program():
-        qapplication.exec()
+    qapplication.exec()
 
-    sys.exit(execute_program())
+    # Delete the windows now, rather than in PyQt's QObject cleanup at exit, during which
+    # Python code that creates or destroys wrapped Qt objects can crash the interpreter
+    # (https://github.com/Python-SIP/sip/pull/121). This can be removed once PyQt5-sip
+    # and PyQt6-sip releases include that fix.
+    from qtutils.qt import PYQT_LIBS
+    if QT_ENV in PYQT_LIBS:
+        import importlib
+        sip = importlib.import_module(f'{QT_ENV}.sip')
+        for widget in qapplication.topLevelWidgets():
+            # Other top-level widgets are owned by C++ objects, which delete them
+            if sip.ispyowned(widget):
+                widget.deleteLater()
+        qapplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)

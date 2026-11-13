@@ -15,7 +15,6 @@ import logging
 
 from qtutils.qt.QtWidgets import QMessageBox
 
-import labscript_utils.excepthook
 import numpy
 import labscript_utils.h5_lock, h5py
 from qtutils import inmain_decorator
@@ -27,6 +26,27 @@ logger = logging.getLogger('BLACS.FrontPanelSettings')
 def _ensure_str(s):
     """convert bytestrings and numpy strings to python strings"""
     return s.decode() if isinstance(s, bytes) else str(s)
+
+def _ensure_bytes(s):
+    """convert strings to UTF-8 bytestrings for storage in a fixed-width bytes field"""
+    return s if isinstance(s, bytes) else str(s).encode()
+
+def _bytes_dtype(values):
+    """Return a fixed-width bytes dtype that is wide enough for all the bytestrings in
+    values"""
+    return 'S%d' % max([1] + [len(v) for v in values])
+
+# The repr of a numpy scalar or array refers only to names in the numpy namespace
+_SAVE_DATA_NAMESPACE = dict(vars(numpy), np=numpy, numpy=numpy)
+
+def eval_save_data(text, description):
+    """Evaluate the repr of a saved settings dictionary. Returns an empty dictionary,
+    and logs a warning naming `description`, if the text cannot be evaluated."""
+    try:
+        return eval(_ensure_str(text), dict(_SAVE_DATA_NAMESPACE))
+    except Exception as e:
+        logger.warning('Could not load %s, ignoring it: %s', description, e)
+        return {}
 
 class FrontPanelSettings(object):
     def __init__(self,settings_path,connection_table):
@@ -84,13 +104,14 @@ class FrontPanelSettings(object):
                 # Get Tab Data
                 dataset = hdf5_file['/front_panel'].get('_notebook_data',[])
 
+                # Shot files do not contain tab positions
+                has_positions = 'notebook' in dataset.dtype.names
                 for row in dataset:
                     tab_name = _ensure_str(row['tab_name'])
-                    tab_data.setdefault(tab_name,{})
-                    try:
-                        tab_data[tab_name] = {'notebook':row['notebook'], 'page':row['page'], 'visible':row['visible'], 'data':eval(_ensure_str(row['data']))}
-                    except Exception:
-                        logger.info("Could not load tab data for %s"%tab_name)
+                    data = eval_save_data(row['data'], 'the saved tab data for %s' % tab_name)
+                    tab_data[tab_name] = {'data':data}
+                    if has_positions:
+                        tab_data[tab_name].update(notebook=row['notebook'], page=row['page'], visible=row['visible'])
 
                 #now get dataset attributes
                 tab_data['BLACS settings'] = dict(dataset.attrs)
@@ -124,7 +145,7 @@ class FrontPanelSettings(object):
                             settings,question,error = self.handle_return_code(data_dict,result,settings,question,error)
         except Exception as e:
             logger.info("Could not load saved settings")
-            logger.info(str(e))
+            logger.info('%s', e)
         return settings,question,error,tab_data
 
     def handle_return_code(self,row,result,settings,question,error):
@@ -232,17 +253,11 @@ class FrontPanelSettings(object):
             try:
                 plugin_data[module_name] = plugin.get_save_data()
             except Exception as e:
-                logger.error('Could not save data for plugin %s. Error was: %s'%(module_name,str(e)))
+                logger.error('Could not save data for plugin %s. Error was: %s', module_name, e)
 
         # save window data
         # Size of window
-        window_data["_main_window"] = {"width":self.window.normalGeometry().width(),
-                                       "height":self.window.normalGeometry().height(),
-                                       "xpos":self.window.normalGeometry().x(),
-                                       "ypos":self.window.normalGeometry().y(),
-                                       "maximized":self.window.isMaximized(),
-                                       "frame_height":abs(self.window.frameGeometry().height()-self.window.normalGeometry().height()),
-                                       "frame_width":abs(self.window.frameGeometry().width()-self.window.normalGeometry().width()),
+        window_data["_main_window"] = {"geometry":self.window.saveGeometry().data(),
                                        "_analysis":self.blacs.analysis_submission.get_save_data(),
                                        "_queue":self.blacs.queue.get_save_data(),
                                       }
@@ -251,6 +266,18 @@ class FrontPanelSettings(object):
             window_data[name] = pane.sizes()
 
         return tab_data,notebook_data,window_data,plugin_data
+
+    @inmain_decorator(wait_for_return=True)
+    def get_shot_data(self):
+        """Return the front panel values and the device settings of each tab, for
+        storing in a shot file with store_shot_front_panel_in_h5()."""
+        return {
+            device_name: {
+                'front_panel': tab.settings['front_panel_settings'],
+                'save_data': tab.get_device_save_data(),
+            }
+            for device_name, tab in self.tablist.items()
+        }
 
     @inmain_decorator(wait_for_return=True)
     def save_front_panel_to_h5(self,current_file,states,tab_positions,window_data,plugin_data,silent = {}, force_new_conn_table = False):
@@ -288,7 +315,7 @@ class FrontPanelSettings(object):
                         overwrite = False
                         if not silent:
                             message = QMessageBox()
-                            message.setText("This file '%s' already contains a connection table."%current_file)
+                            message.setText("This file '%s' already contains a front panel configuration."%current_file)
                             message.setInformativeText("Do you wish to replace the existing front panel configuration in this file?")
                             message.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
                             message.setDefaultButton(QMessageBox.No)
@@ -313,7 +340,7 @@ class FrontPanelSettings(object):
                                 message.setWindowTitle("BLACS")
                                 message.exec()
                             else:
-                                logger.info("Front Panel not saved as it already existed in the h5 file '"+current_file+"'")
+                                logger.info("Front Panel not saved as it already existed in the h5 file '%s'", current_file)
                             return
                     else:
                         # Save Front Panel in here
@@ -327,86 +354,87 @@ class FrontPanelSettings(object):
                     message.setWindowTitle("BLACS")
                     message.exec()
                 else:
-                    logger.info("Front Panel not saved as the connection table in the h5 file '"+current_file+"' didn't match the current connection table.")
+                    logger.info("Front Panel not saved as the connection table in the h5 file '%s' didn't match the current connection table.", current_file)
                 return
         else:
             with h5py.File(current_file,'w') as hdf5_file:
                 # save connection table, save front panel
                 self.store_front_panel_in_h5(hdf5_file,states,tab_positions,window_data,plugin_data,save_conn_table=True)
 
-    @inmain_decorator(wait_for_return=True)
-    def store_front_panel_in_h5(self, hdf5_file,tab_data,notebook_data,window_data,plugin_data,save_conn_table=False,save_queue_data=True):
+    def store_front_panel_in_h5(self, hdf5_file,tab_data,notebook_data,window_data,plugin_data,save_conn_table=False):
         if save_conn_table:
             if 'connection table' in hdf5_file:
                 del hdf5_file['connection table']
             hdf5_file.create_dataset('connection table', data=self.connection_table.raw_table)
 
         data_group = hdf5_file['/'].create_group('front_panel')
+        self._store_front_panel_values(data_group, tab_data)
 
-        front_panel_list = []
-        other_data_list = []
-        front_panel_dtype = [('name','a256'),('device_name','a256'),('channel','a256'),('base_value',float),('locked',bool),('base_step_size',float),('current_units','a256')]
-        max_od_length = 2 # empty dictionary
-
-        # Iterate over each device within a class
-        for device_name, device_state in tab_data.items():
-            logger.debug("saving front panel for device:" + device_name)
-            # Insert front panel data into dataset
-            for hardware_name, data in device_state["front_panel"].items():
-                if data != {}:
-                    if isinstance(data['base_value'], (str, bytes)):
-                        logger.warning('Could not save data for channel %s on device %s because support for output values that are strings is not yet supported.'%(hardware_name, device_name))
-                        # TODO: Implement saving of Image output type
-                    elif float(data['base_value']) == data['base_value']:
-                        front_panel_list.append((data['name'],
-                                                 device_name,
-                                                 hardware_name,
-                                                 data['base_value'],
-                                                 data['locked'],
-                                                 data['base_step_size'] if 'base_step_size' in data else 0,
-                                                 data['current_units'] if 'current_units' in data else ''
-                                                )
-                                               )
-                    else:
-                        logger.warning('Could not save data for channel %s on device %s because the output value (in base units) was not a string or could not be coerced to a float without loss of precision'%(hardware_name, device_name))
-
-            # Save "other data"
-            od = repr(device_state["save_data"])
-            other_data_list.append(od)
-            max_od_length = len(od) if len(od) > max_od_length else max_od_length
-
-        # Create datasets
-        if front_panel_list:
-            front_panel_array = numpy.empty(len(front_panel_list),dtype=front_panel_dtype)
-            for i, row in enumerate(front_panel_list):
-                front_panel_array[i] = row
-            data_group.create_dataset('front_panel',data=front_panel_array)
-
-        # Save tab data
-        i = 0
-        tab_data = numpy.empty(len(notebook_data),dtype=[('tab_name','a256'),('notebook','a2'),('page',int),('visible',bool),('data','a'+str(max_od_length))])
-        for device_name,data in notebook_data.items():
-            tab_data[i] = (device_name,data["notebook"],data["page"],data["visible"],other_data_list[i])
-            i += 1
+        # Save tab data. A device whose tab is not open is recorded in notebook 0, page 0.
+        tab_names = [_ensure_bytes(device_name) for device_name in tab_data]
+        other_data = [repr(device_state["save_data"]).encode() for device_state in tab_data.values()]
+        positions = [notebook_data.get(device_name, {"notebook": 0, "page": 0, "visible": False}) for device_name in tab_data]
+        notebook_array = numpy.array(
+            [
+                (name, position["notebook"], position["page"], position["visible"], od)
+                for name, position, od in zip(tab_names, positions, other_data)
+            ],
+            dtype=[('tab_name',_bytes_dtype(tab_names)),('notebook','S2'),('page',int),('visible',bool),('data',_bytes_dtype(other_data))],
+        )
 
         # Save BLACS Main GUI Info
-        dataset = data_group.create_dataset("_notebook_data",data=tab_data)
-        dataset.attrs["window_width"] = window_data["_main_window"]["width"]
-        dataset.attrs["window_height"] = window_data["_main_window"]["height"]
-        dataset.attrs["window_xpos"] = window_data["_main_window"]["xpos"]
-        dataset.attrs["window_ypos"] = window_data["_main_window"]["ypos"]
-        dataset.attrs["window_maximized"] = window_data["_main_window"]["maximized"]
-        dataset.attrs["window_frame_height"] = window_data["_main_window"]["frame_height"]
-        dataset.attrs["window_frame_width"] = window_data["_main_window"]["frame_width"]
+        dataset = data_group.create_dataset("_notebook_data",data=notebook_array)
+        # An opaque HDF5 type keeps the null bytes in the geometry intact
+        dataset.attrs["window_geometry"] = numpy.void(window_data["_main_window"]["geometry"])
         dataset.attrs['plugin_data'] = repr(plugin_data)
         dataset.attrs['analysis_data'] = repr(window_data["_main_window"]["_analysis"])
-        if save_queue_data:
-            dataset.attrs['queue_data'] = repr(window_data["_main_window"]["_queue"])
+        dataset.attrs['queue_data'] = repr(window_data["_main_window"]["_queue"])
         for pane_name,pane_position in window_data.items():
             if pane_name != "_main_window":
                 dataset.attrs[pane_name] = pane_position
 
-        # Save analysis server settings:
-        #dataset = data_group.create_group("analysis_server")
-        #dataset.attrs['send_for_analysis'] = self.blacs.analysis_submission.toggle_analysis.get_active()
-        #dataset.attrs['server'] = self.blacs.analysis_submission.analysis_host.get_text()
+    def store_shot_front_panel_in_h5(self, hdf5_file, shot_data):
+        """Store the front panel values and device settings returned by
+        get_shot_data() in a shot file"""
+        data_group = hdf5_file['/'].create_group('front_panel')
+        self._store_front_panel_values(data_group, shot_data)
+        tab_names = [_ensure_bytes(device_name) for device_name in shot_data]
+        save_data = [repr(device_state["save_data"]).encode() for device_state in shot_data.values()]
+        data_group.create_dataset(
+            "_notebook_data",
+            data=numpy.array(
+                list(zip(tab_names, save_data)),
+                dtype=[('tab_name', _bytes_dtype(tab_names)), ('data', _bytes_dtype(save_data))],
+            ),
+        )
+
+    def _store_front_panel_values(self, data_group, tab_data):
+        front_panel_list = []
+
+        # Iterate over each device within a class
+        for device_name, device_state in tab_data.items():
+            logger.debug("saving front panel for device:%s", device_name)
+            # Insert front panel data into dataset
+            for hardware_name, data in device_state["front_panel"].items():
+                if data != {}:
+                    if isinstance(data['base_value'], (str, bytes)):
+                        logger.debug('Could not save data for channel %s on device %s because support for output values that are strings is not yet supported.', hardware_name, device_name)
+                        # TODO: Implement saving of Image output type
+                    elif float(data['base_value']) == data['base_value']:
+                        front_panel_list.append((_ensure_bytes(data['name']),
+                                                 _ensure_bytes(device_name),
+                                                 _ensure_bytes(hardware_name),
+                                                 data['base_value'],
+                                                 data['locked'],
+                                                 data['base_step_size'] if 'base_step_size' in data else 0,
+                                                 _ensure_bytes(data['current_units'] if 'current_units' in data else '')
+                                                )
+                                               )
+                    else:
+                        logger.warning('Could not save data for channel %s on device %s because the output value (in base units) was not a string or could not be coerced to a float without loss of precision', hardware_name, device_name)
+
+        if front_panel_list:
+            names, device_names, channels, _, _, _, units = zip(*front_panel_list)
+            front_panel_dtype = [('name',_bytes_dtype(names)),('device_name',_bytes_dtype(device_names)),('channel',_bytes_dtype(channels)),('base_value',float),('locked',bool),('base_step_size',float),('current_units',_bytes_dtype(units))]
+            data_group.create_dataset('front_panel',data=numpy.array(front_panel_list,dtype=front_panel_dtype))
+

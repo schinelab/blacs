@@ -12,7 +12,6 @@
 #####################################################################
 import logging
 import os
-import subprocess
 import sys
 import ast
 
@@ -22,6 +21,8 @@ from qtutils.qt.QtWidgets import QMessageBox, QFileDialog
 
 from blacs.compile_and_restart import CompileAndRestart
 from labscript_utils.filewatcher import FileWatcher
+from labscript_utils.labconfig import LabConfig
+from labscript_utils.programs import open_file
 from qtutils import inmain, UiLoader
 from blacs.plugins import PLUGINS_DIR
 
@@ -101,20 +102,11 @@ class Menu(object):
         self.BLACS['settings'].create_dialog(goto_page=Setting)
       
     def on_edit_connection_table(self,*args,**kwargs):
-        # get path to text editor
-        editor_path = self.BLACS['exp_config'].get('programs','text_editor')
-        editor_args = self.BLACS['exp_config'].get('programs','text_editor_arguments')
-        if editor_path:  
-            if '{file}' in editor_args:
-                editor_args = editor_args.replace('{file}', self.BLACS['exp_config'].get('paths','connection_table_py'))
-            else:
-                editor_args = self.BLACS['exp_config'].get('paths','connection_table_py') + " " + editor_args            
-            try:
-                subprocess.Popen([editor_path,editor_args])
-            except Exception:
-                QMessageBox.information(self.BLACS['ui'],"Error","Unable to launch text editor. Check the path is valid in the experiment config file (%s) (you must restart BLACS if you edit this file)"%self.BLACS['exp_config'].config_path)
-        else:
-            QMessageBox.information(self.BLACS['ui'],"Error","No text editor path was specified in the experiment config file (%s) (you must restart BLACS if you edit this file)"%self.BLACS['exp_config'].config_path)
+        connection_table_py = self.BLACS['exp_config'].get('paths','connection_table_py')
+        try:
+            open_file(connection_table_py, 'text_editor', self.BLACS['exp_config'])
+        except Exception as e:
+            QMessageBox.information(self.BLACS['ui'],"Error","Unable to launch text editor. Error was: %s. The text editor is set in the [programs] section of the experiment config file (%s) (you must restart BLACS if you edit this file)"%(e, self.BLACS['exp_config'].config_path))
     
     def on_recompile_connection_table(self,*args,**kwargs):
         logger.info('recompile connection table called')
@@ -183,16 +175,16 @@ class RecompileNotification(object):
         
     def callback(self, name, info, event=None):
         if event  == 'deleted':
-            logger.info('{} {} ({})'.format(name, event, info))
+            logger.info('%s %s (%s)', name, event, info)
             inmain(self._show)
         if event  == 'modified':
-            logger.info('{} {} ({})'.format(name, event, info))
+            logger.info('%s %s (%s)', name, event, info)
             inmain(self._show)
         elif event  == 'original':
             logger.info('All watched files restored')
             inmain(self._close)
         elif event == 'restored':
-            logger.info('{} {} ({})'.format(name, event, info))
+            logger.info('%s %s (%s)', name, event, info)
         elif event ==  'debug':
             logger.info(info)
 
@@ -209,7 +201,7 @@ class RecompileNotification(object):
             polling_interval = self.BLACS['exp_config'].getfloat('BLACS/plugins', 'connection_table.polling_interval')
         except labconfig.NoOptionError:
             polling_interval = 1
-        logger.info('Using hashable_types: {}; polling_interval: {}'.format(hashable_types, polling_interval))
+        logger.info('Using hashable_types: %s; polling_interval: %s', hashable_types, polling_interval)
         
         # append the list of globals
         file_list += self.BLACS['settings'].get_value(Setting,'globals_list')
@@ -387,9 +379,17 @@ class Setting(object):
     def close(self):
         pass
         
+    def default_directory(self, key):
+        """The directory in which a file dialog opens: the labconfig path with the
+        given key, or C:\\ if labconfig does not define it"""
+        try:
+            return LabConfig().get('paths', key)
+        except (LabConfig.NoOptionError, LabConfig.NoSectionError):
+            return "C:\\"
+
     def add_global_file(self,*args,**kwargs):
         # create file chooser dialog
-        dialog = QFileDialog(None,"select globals files", "C:\\", "HDF5 files (*.h5 *.hdf5)")
+        dialog = QFileDialog(None,"select globals files", self.default_directory('experiment_shot_storage'), "HDF5 files (*.h5 *.hdf5)")
         dialog.setViewMode(QFileDialog.Detail)
         dialog.setFileMode(QFileDialog.ExistingFiles)
         
@@ -426,7 +426,7 @@ class Setting(object):
             
     def add_calibration_file(self):
         # create file chooser dialog
-        dialog = QFileDialog(None,"Select unit conversion scripts", "C:\\", "Python files (*.py *.pyw)")
+        dialog = QFileDialog(None,"Select unit conversion scripts", self.default_directory('userlib'), "Python files (*.py *.pyw)")
         dialog.setViewMode(QFileDialog.Detail)
         dialog.setFileMode(QFileDialog.ExistingFiles)
         
@@ -449,7 +449,7 @@ class Setting(object):
         
     def add_calibration_folder(self):
         # create file chooser dialog
-        dialog = QFileDialog(None,"Select unit conversion folder", "C:\\", "")
+        dialog = QFileDialog(None,"Select unit conversion folder", self.default_directory('userlib'), "")
         dialog.setViewMode(QFileDialog.Detail)
         dialog.setFileMode(QFileDialog.Directory)
         

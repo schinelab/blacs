@@ -31,7 +31,7 @@ class CompileAndRestart(QDialog):
         self.globals_files = globals_files
         self.labscript_file = connection_table_labscript
         self.output_path = output_path
-        self.tempfilename = self.output_path.strip('.h5')+'.temp.h5'
+        self.tempfilename = os.path.splitext(self.output_path)[0] + '.temp.h5'
         self.blacs = blacs
         self.close_notification_func = close_notification_func
         
@@ -43,6 +43,7 @@ class CompileAndRestart(QDialog):
         self.ui.restart.clicked.connect(self.restart)
         self.ui.compile.clicked.connect(self.compile)
         self.ui.cancel.clicked.connect(self.reject)
+        self.finished.connect(self.output_box.shutdown)
         
         self.setLayout(self.ui.layout())
         self.resize(500, 300)
