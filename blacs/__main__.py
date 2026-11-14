@@ -24,7 +24,7 @@ desktop_app.set_process_appid('blacs')
 
 # Splash screen
 from labscript_utils.splash import Splash
-splash = Splash(os.path.join(os.path.dirname(__file__), 'blacs.svg'))
+splash = Splash(os.path.join(os.path.dirname(__file__), 'blacs.ico'))
 splash.show()
 
 splash.update_text('importing standard library modules')
